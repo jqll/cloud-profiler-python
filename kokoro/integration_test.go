@@ -33,39 +33,19 @@ import (
 )
 
 var (
-	repo              = flag.String("repo", "https://github.com/GoogleCloudPlatform/cloud-profiler-python.git", "git repo to test")
-	branch            = flag.String("branch", "", "git branch to test")
-	commit            = flag.String("commit", "", "git commit to test")
-	pr                = flag.Int("pr", 0, "git pull request to test")
+	gcsLocation       = flag.String("gcs_location", "", "GCS location for the agent")
 	runID             = strings.Replace(time.Now().Format("2006-01-02-15-04-05.000000-0700"), ".", "-", -1)
 	benchFinishString = "busybench finished profiling"
 	errorString       = "failed to set up or run the benchmark"
 )
 
-const cloudScope = "https://www.googleapis.com/auth/cloud-platform"
+const (
+	cloudScope       = "https://www.googleapis.com/auth/cloud-platform"
+	storageReadScope = "https://www.googleapis.com/auth/devstorage.read_only"
+)
 
 const startupTemplate = `
-#! /bin/bash
-(
-# Signal any unexpected error.
-trap 'echo "{{.ErrorString}}"' ERR
-
-# Shut down the VM in 5 minutes after this script exits
-# to stop accounting the VM for billing and cores quota.
-trap "sleep 300 && poweroff" EXIT
-
-retry() {
-  for i in {1..3}; do
-    "${@}" && return 0
-  done
-  return 1
-}
-
-# Fail on any error.
-set -eo pipefail
-
-# Display commands being run
-set -x
+{{- template "prologue" . }}
 
 # Install dependencies.
 retry apt-get update >/dev/null
@@ -84,16 +64,11 @@ retry {{.PythonCommand}} /tmp/get-pip.py >/dev/null
 retry {{.PythonCommand}} -m pip install --upgrade pyasn1 >/dev/null
 
 # Fetch agent.
-retry git clone {{.Repo}}
-cd cloud-profiler-python
-retry git fetch origin {{if .PR}}pull/{{.PR}}/head{{else}}{{.Branch}}{{end}}:pull_branch
-git checkout pull_branch
-git reset --hard {{.Commit}}
+mkdir /tmp/agent
+retry gsutil cp gs://{{.GCSLocation}}/* /tmp/agent
 
 # Install agent.
-{{.PythonCommand}} setup.py sdist
-cd dist/
-{{.PythonCommand}} -m pip install "$(basename -- $(find . -name "google-cloud-profiler*"))"
+{{.PythonCommand}} -m pip install "$(find /tmp/agent -name "google-cloud-profiler*")"
 
 # Run bench app.
 export BENCH_DIR="$HOME/bench"
@@ -129,14 +104,13 @@ if __name__ == '__main__':
   repeat_bench(3 * 60)
 EOF
 
-# TODO(b/133360821): Stop ignoring exit code SIGALRM when b/133360821 is fixed.
+# TODO: Stop ignoring exit code SIGALRM when b/133360821 is fixed.
 {{.PythonCommand}} bench.py || [ "$?" -eq "142" ]
 
 # Indicate to test that script has finished running.
 echo "{{.FinishString}}"
 
-# Write output to serial port 2 with timestamp.
-) 2>&1 | while read line; do echo "$(date): ${line}"; done >/dev/ttyS1
+{{ template "epilogue" . -}}
 `
 
 type testCase struct {
@@ -159,24 +133,18 @@ func (tc *testCase) initializeStartUpScript(template *template.Template) error {
 	err := template.Execute(&buf,
 		struct {
 			Service              string
+			GCSLocation          string
 			InstallPythonVersion string
 			PythonCommand        string
 			VersionCheck         string
-			Repo                 string
-			PR                   int
-			Branch               string
-			Commit               string
 			FinishString         string
 			ErrorString          string
 		}{
 			Service:              tc.name,
+			GCSLocation:          *gcsLocation,
 			InstallPythonVersion: tc.installPythonVersion,
 			PythonCommand:        tc.pythonCommand,
 			VersionCheck:         tc.versionCheck,
-			Repo:                 *repo,
-			PR:                   *pr,
-			Branch:               *branch,
-			Commit:               *commit,
 			FinishString:         benchFinishString,
 			ErrorString:          errorString,
 		})
@@ -198,8 +166,8 @@ func TestAgentIntegration(t *testing.T) {
 		t.Fatalf("Getenv(GCLOUD_TESTS_PYTHON_ZONE) got empty string")
 	}
 
-	if *commit == "" {
-		t.Fatal("commit flag is not set")
+	if *gcsLocation == "" {
+		t.Fatal("gcsLocation flag is not set")
 	}
 
 	ctx := context.Background()
@@ -213,8 +181,7 @@ func TestAgentIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to initialize compute Service: %v", err)
 	}
-
-	template, err := template.New("startupScript").Parse(startupTemplate)
+	template, err := proftest.BaseStartupTmpl.Parse(startupTemplate)
 	if err != nil {
 		t.Fatalf("failed to parse startup script template: %v", err)
 	}
@@ -236,6 +203,7 @@ func TestAgentIntegration(t *testing.T) {
 				MachineType:  "n1-standard-1",
 				ImageProject: "ubuntu-os-cloud",
 				ImageFamily:  "ubuntu-1804-lts",
+				Scopes:       []string{storageReadScope},
 			},
 			name: fmt.Sprintf("profiler-test-python2-%s-gce", runID),
 			wantProfiles: map[string]string{
@@ -255,6 +223,7 @@ func TestAgentIntegration(t *testing.T) {
 				MachineType:  "n1-standard-1",
 				ImageProject: "ubuntu-os-cloud",
 				ImageFamily:  "ubuntu-1804-lts",
+				Scopes:       []string{storageReadScope},
 			},
 			name: fmt.Sprintf("profiler-test-python3-%s-gce", runID),
 			wantProfiles: map[string]string{
@@ -274,6 +243,7 @@ func TestAgentIntegration(t *testing.T) {
 				ImageProject: "ubuntu-os-cloud",
 				// ppa:deadsnakes/ppa is not yet available on Ubuntu 18.10.
 				ImageFamily: "ubuntu-1604-lts",
+				Scopes:      []string{storageReadScope},
 			},
 			name: fmt.Sprintf("profiler-test-python35-%s-gce", runID),
 			wantProfiles: map[string]string{
@@ -305,7 +275,7 @@ func TestAgentIntegration(t *testing.T) {
 				}
 			}()
 
-			timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute*10)
+			timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute*20)
 			defer cancel()
 			if err := gceTr.PollForSerialOutput(timeoutCtx, &tc.InstanceConfig, benchFinishString, errorString); err != nil {
 				t.Fatal(err)
